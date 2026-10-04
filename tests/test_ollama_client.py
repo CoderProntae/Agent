@@ -84,6 +84,94 @@ def mock_server():
     server.server_close()
 
 
+class _GenerateOnlyHandler(BaseHTTPRequestHandler):
+    """Ollama-compatible server exposing ONLY /api/generate (+ tags/version)."""
+
+    prompts_seen: list[str] = []
+
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):  # noqa: N802
+        if self.path == "/api/version":
+            self._json(200, {"version": "gen-only"})
+        elif self.path == "/api/tags":
+            self._json(200, {"models": [{"name": "qwen3.5-9b-abliterated"}]})
+        else:
+            self._json(404, {"error": "not found"})
+
+    def do_POST(self):  # noqa: N802
+        if self.path == "/api/chat":
+            self._json(404, {"error": "chat endpoint not implemented"})
+            return
+        if self.path != "/api/generate":
+            self._json(404, {"error": "not found"})
+            return
+        length = int(self.headers.get("Content-Length", 0))
+        body = json.loads(self.rfile.read(length) or b"{}")
+        type(self).prompts_seen.append(body.get("prompt", ""))
+
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-ndjson")
+        self.end_headers()
+        for token in ("Üret", "im", " modu"):
+            frame = {"model": body.get("model", ""), "response": token, "done": False}
+            self.wfile.write((json.dumps(frame) + "\n").encode())
+        final = {
+            "model": body.get("model", ""),
+            "response": "",
+            "done": True,
+            "prompt_eval_count": 7,
+            "eval_count": 3,
+        }
+        self.wfile.write((json.dumps(final) + "\n").encode())
+
+    def _json(self, code: int, payload: dict):
+        data = json.dumps(payload).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+
+@pytest.fixture()
+def generate_only_server():
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _GenerateOnlyHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield f"http://127.0.0.1:{server.server_address[1]}"
+    server.shutdown()
+    server.server_close()
+
+
+def test_fallback_to_generate_on_chat_404(generate_only_server):
+    """Servers without /api/chat must be served via /api/generate."""
+    _GenerateOnlyHandler.prompts_seen = []
+    client = OllamaClient(base_url=generate_only_server, max_retries=0)
+    messages = [
+        {"role": "system", "content": "Sen bir ajansın."},
+        {"role": "user", "content": "merhaba"},
+    ]
+    chunks = list(client.chat_stream(messages))
+    assert "".join(c.text for c in chunks) == "Üretim modu"
+    assert chunks[-1].done
+    assert chunks[-1].prompt_tokens == 7
+    assert chunks[-1].completion_tokens == 3
+
+    # The conversation was flattened into a prompt with role markers.
+    prompt = _GenerateOnlyHandler.prompts_seen[0]
+    assert "[SYSTEM]" in prompt and "[USER]" in prompt
+    assert "merhaba" in prompt
+    assert prompt.rstrip().endswith("[ASSISTANT]")
+
+    # Endpoint latched: the next call goes straight to /api/generate
+    # (only one chat-404 round-trip ever happened).
+    list(client.chat_stream([{"role": "user", "content": "ikinci"}]))
+    assert len(_GenerateOnlyHandler.prompts_seen) == 2
+    assert client._force_generate is True
+
+
 def test_version_and_health(mock_server):
     client = OllamaClient(base_url=mock_server, max_retries=0)
     assert client.version() == "0.9.9-mock"

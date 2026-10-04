@@ -109,6 +109,9 @@ class OllamaClient:
         self._session.headers.update(
             {"Content-Type": "application/json", "Connection": "keep-alive"}
         )
+        # Some Ollama-compatible servers implement only /api/generate.
+        # When /api/chat answers 404 we latch onto the generate endpoint.
+        self._force_generate = False
 
     # -- helpers ------------------------------------------------------------
     def _url(self, path: str) -> str:
@@ -232,22 +235,74 @@ class OllamaClient:
     ) -> Iterator[StreamChunk]:
         """Stream a chat completion, yielding :class:`StreamChunk` objects.
 
+        Primary endpoint is ``POST /api/chat``. If the server answers
+        **404** (Ollama-compatible backends that only expose the classic
+        ``/api/generate`` route), the client transparently retries the turn
+        against ``/api/generate`` with the conversation flattened into a
+        prompt, and latches onto that endpoint for subsequent calls.
+
         ``on_retry`` (optional) is invoked whenever a full request attempt
         fails and is about to be retried, so the UI can surface the
         self-healing behaviour ("retrying…") instead of silently waiting.
         """
-        payload: dict[str, Any] = {
-            "model": model or self.model,
-            "messages": messages,
+        chosen_model = model or self.model
+        options: dict[str, Any] = {"temperature": temperature}
+        if max_tokens:
+            options["num_predict"] = int(max_tokens)
+
+        if not self._force_generate:
+            chat_payload: dict[str, Any] = {
+                "model": chosen_model,
+                "messages": messages,
+                "stream": True,
+                "keep_alive": keep_alive or self.keep_alive,
+                "options": options,
+            }
+            try:
+                response = self._post_with_notify(
+                    "/api/chat", chat_payload, stream=True, on_retry=on_retry
+                )
+            except OllamaAPIError as exc:
+                if exc.status_code == 404:
+                    logger.warning(
+                        "Sunucu /api/chat uç noktasını sunmuyor (404); "
+                        "/api/generate kullanılıyor."
+                    )
+                    self._force_generate = True
+                else:
+                    raise
+            else:
+                return self._iter_stream(response)
+
+        generate_payload: dict[str, Any] = {
+            "model": chosen_model,
+            "prompt": self._messages_to_prompt(messages),
             "stream": True,
             "keep_alive": keep_alive or self.keep_alive,
-            "options": {"temperature": temperature},
+            "options": options,
         }
-        if max_tokens:
-            payload["options"]["num_predict"] = int(max_tokens)
-
-        response = self._post_with_notify("/api/chat", payload, stream=True, on_retry=on_retry)
+        response = self._post_with_notify(
+            "/api/generate", generate_payload, stream=True, on_retry=on_retry
+        )
         return self._iter_stream(response)
+
+    @staticmethod
+    def _messages_to_prompt(messages: list[dict[str, Any]]) -> str:
+        """Flatten a chat history into a single prompt for /api/generate."""
+        parts: list[str] = []
+        for message in messages:
+            role = message.get("role", "user")
+            content = (message.get("content") or "").strip()
+            if not content:
+                continue
+            if role == "system":
+                parts.append(f"[SYSTEM]\n{content}")
+            elif role == "assistant":
+                parts.append(f"[ASSISTANT]\n{content}")
+            else:
+                parts.append(f"[USER]\n{content}")
+        parts.append("[ASSISTANT]")
+        return "\n\n".join(parts)
 
     def _post_with_notify(
         self,
@@ -290,7 +345,12 @@ class OllamaClient:
         raise last_error
 
     def _iter_stream(self, response: requests.Response) -> Iterator[StreamChunk]:
-        """Parse newline-delimited JSON frames from a chunked response."""
+        """Parse newline-delimited JSON frames from a chunked response.
+
+        Handles both wire formats: ``/api/chat`` frames carry the delta in
+        ``message.content`` while classic ``/api/generate`` frames carry it
+        in ``response``.
+        """
         try:
             for raw_line in response.iter_lines(decode_unicode=True):
                 if not raw_line:
@@ -301,8 +361,9 @@ class OllamaClient:
                     logger.warning("Ollama akışında çözümlenemeyen çerçeve: %.200s", raw_line)
                     continue
                 message = frame.get("message") or {}
+                text = message.get("content") or frame.get("response") or ""
                 yield StreamChunk(
-                    text=message.get("content", "") or "",
+                    text=text,
                     done=bool(frame.get("done", False)),
                     prompt_tokens=int(frame.get("prompt_eval_count", 0) or 0),
                     completion_tokens=int(frame.get("eval_count", 0) or 0),

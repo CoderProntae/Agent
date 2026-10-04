@@ -124,6 +124,11 @@ class SettingsDialog(QDialog):
         buttons.addButton(test_btn, QDialogButtonBox.ActionRole)
         root.addWidget(buttons)
 
+        # Auto-load the installed model list as soon as the dialog opens.
+        from PySide6.QtCore import QTimer
+
+        QTimer.singleShot(0, self._refresh_models)
+
     # ------------------------------------------------------------------
     def _client_from_form(self) -> OllamaClient:
         cfg = AppConfig(
@@ -136,19 +141,33 @@ class SettingsDialog(QDialog):
         return OllamaClient(base_url=cfg.base_url)
 
     def _refresh_models(self) -> None:
+        current = self.model_combo.currentText().strip() or self.config.model
+        self.model_status.setText(f"Modeller getiriliyor… ({self._client_from_form().base_url})")
         try:
-            models = self._client_from_forms().list_models()
+            models = self._client_from_form().list_models()
         except OllamaError as exc:
             self.model_status.setText(f"⚠ Model listesi alınamadı: {exc}")
             return
+        self.model_combo.blockSignals(True)
         self.model_combo.clear()
         self.model_combo.addItems(models)
-        if self.config.model in models:
-            self.model_combo.setCurrentText(self.config.model)
-        self.model_status.setText(f"{len(models)} model bulundu.")
+        self.model_combo.blockSignals(False)
+        if models:
+            if current in models:
+                self.model_combo.setCurrentText(current)
+            else:
+                # Keep the configured model visible even if the server list
+                # disagrees (editable combo), then the server's first model.
+                self.model_combo.setEditText(current)
+                self.model_combo.insertItem(0, current)
+                self.model_combo.setCurrentIndex(0)
+            self.model_status.setText(f"{len(models)} model bulundu — listeden seçebilirsiniz.")
+        else:
+            self.model_combo.setEditText(current)
+            self.model_status.setText("Sunucuda kayıtlı model bulunamadı; model adı elle girilebilir.")
 
     def _test_connection(self) -> None:
-        client = self._client_from_forms()
+        client = self._client_from_form()
         try:
             version = client.version()
             QMessageBox.information(self, "Bağlantı başarılı", f"Ollama sürümü: {version}\n({client.base_url})")

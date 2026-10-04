@@ -59,6 +59,55 @@ def test_diff_rendering(qapp):
     assert diff_to_html("")  # empty diff handled
 
 
+def test_settings_dialog_autoloads_models(qapp):
+    """Opening Settings must auto-fetch the model list from /api/tags."""
+    import json
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class _TagsHandler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):  # noqa: N802
+            if self.path == "/api/tags":
+                data = json.dumps(
+                    {"models": [{"name": "qwen3.5-9b-abliterated"}, {"name": "llama3.1"}]}
+                ).encode()
+            elif self.path == "/api/version":
+                data = json.dumps({"version": "x"}).encode()
+            else:
+                data = b"{}"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _TagsHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    port = server.server_address[1]
+    try:
+        from agentdesk.core.config import AppConfig
+        from agentdesk.ui.settings_dialog import SettingsDialog
+
+        config = AppConfig(ollama_port=port, max_retries=0, connect_timeout=2)
+        dialog = SettingsDialog(config)
+        # Spin the event loop until the async model fetch lands (max ~5s).
+        from PySide6.QtCore import QDeadlineTimer
+
+        deadline = QDeadlineTimer(5000)
+        while "model bulunamadı" not in dialog.model_status.text() and \
+              dialog.model_combo.count() < 2 and not deadline.hasExpired():
+            qapp.processEvents()
+        assert dialog.model_combo.count() == 2
+        assert "qwen3.5-9b-abliterated" in [dialog.model_combo.itemText(i) for i in range(2)]
+        dialog.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def test_usage_limit_editor_window(qapp):
     from agentdesk.usage_editor.main import UsageLimitEditorWindow
 
