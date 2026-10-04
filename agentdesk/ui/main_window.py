@@ -86,10 +86,11 @@ class MainWindow(QMainWindow):
         self._heartbeat.timeout.connect(lambda: self.usage_panel.heartbeat(15.0))
         self._heartbeat.start(15_000)
 
-        # Connectivity poll for the status bar dot.
+        # Connectivity poll for the status bar dot (kept sparse on purpose
+        # so it doesn't flood lightweight backend logs).
         self._conn_timer = QTimer(self)
         self._conn_timer.timeout.connect(self._poll_connection)
-        self._conn_timer.start(20_000)
+        self._conn_timer.start(30_000)
         QTimer.singleShot(300, self._poll_connection)
 
     # ------------------------------------------------------------------

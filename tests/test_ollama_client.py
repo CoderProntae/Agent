@@ -145,6 +145,116 @@ def generate_only_server():
     server.server_close()
 
 
+class _OpenAIOnlyHandler(BaseHTTPRequestHandler):
+    """Server exposing ONLY the OpenAI-compatible /v1/chat/completions."""
+
+    bodies_seen: list[dict] = []
+
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):  # noqa: N802
+        if self.path == "/api/version":
+            self._json(200, {"version": "openai-only"})
+        else:
+            self._json(404, {"error": "not found"})
+
+    def do_POST(self):  # noqa: N802
+        if self.path == "/v1/chat/completions":
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length) or b"{}")
+            type(self).bodies_seen.append(body)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            for token in ("Açık", "AI", " modu"):
+                frame = {"model": body.get("model", ""), "choices": [{"delta": {"content": token}}]}
+                self.wfile.write(f"data: {json.dumps(frame)}\n\n".encode())
+            usage_frame = {
+                "model": body.get("model", ""),
+                "choices": [{"delta": {}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 31, "completion_tokens": 5},
+            }
+            self.wfile.write(f"data: {json.dumps(usage_frame)}\n\n".encode())
+            self.wfile.write(b"data: [DONE]\n\n")
+        else:
+            self._json(404, {"error": f"no route for {self.path}"})
+
+    def _json(self, code: int, payload: dict):
+        data = json.dumps(payload).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+
+@pytest.fixture()
+def openai_only_server():
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _OpenAIOnlyHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    yield f"http://127.0.0.1:{server.server_address[1]}"
+    server.shutdown()
+    server.server_close()
+
+
+def test_fallback_to_openai_completions_when_both_ollama_routes_missing(openai_only_server):
+    """chat+generate 404 → client must negotiate /v1/chat/completions (SSE)."""
+    _OpenAIOnlyHandler.bodies_seen = []
+    client = OllamaClient(base_url=openai_only_server, max_retries=0)
+    messages = [{"role": "user", "content": "selam"}]
+
+    chunks = list(client.chat_stream(messages))
+    assert "".join(c.text for c in chunks) == "AçıkAI modu"
+    final = chunks[-1]
+    assert final.done
+    assert final.prompt_tokens == 31
+    assert final.completion_tokens == 5
+
+    # Request body kept OpenAI semantics (messages passthrough).
+    assert _OpenAIOnlyHandler.bodies_seen[0]["messages"] == messages
+    assert _OpenAIOnlyHandler.bodies_seen[0]["stream"] is True
+
+    # Latched: second turn hits only the OpenAI route (one body total so far,
+    # one more after the second call).
+    assert client._openai_mode is True
+    list(client.chat_stream([{"role": "user", "content": "tekrar"}]))
+    assert len(_OpenAIOnlyHandler.bodies_seen) == 2
+
+
+def test_all_endpoints_missing_reports_tried_routes(monkeypatch):
+    """When nothing answers, the error must list every probed endpoint."""
+    from http.server import BaseHTTPRequestHandler as _H
+
+    class _AllNotFound(_H):
+        def log_message(self, *args):
+            pass
+
+        def do_POST(self):  # noqa: N802
+            data = b'{"error":"not found"}'
+            self.send_response(404)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _AllNotFound)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        client = OllamaClient(
+            base_url=f"http://127.0.0.1:{server.server_address[1]}", max_retries=0
+        )
+        with pytest.raises(OllamaAPIError) as exc:
+            list(client.chat_stream([{"role": "user", "content": "x"}]))
+        message = str(exc.value)
+        assert "/api/chat" in message
+        assert "/api/generate" in message
+        assert "/v1/chat/completions" in message
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def test_fallback_to_generate_on_chat_404(generate_only_server):
     """Servers without /api/chat must be served via /api/generate."""
     _GenerateOnlyHandler.prompts_seen = []

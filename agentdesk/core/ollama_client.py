@@ -109,9 +109,15 @@ class OllamaClient:
         self._session.headers.update(
             {"Content-Type": "application/json", "Connection": "keep-alive"}
         )
-        # Some Ollama-compatible servers implement only /api/generate.
-        # When /api/chat answers 404 we latch onto the generate endpoint.
+        # Endpoint negotiation state. Different Ollama-compatible servers
+        # expose different generation routes:
+        #   * full Ollama          → /api/chat + /api/generate
+        #   * generate-only builds → /api/generate
+        #   * OpenAI-style proxies → /v1/chat/completions
+        # The client probes in that order on 404 and latches onto the
+        # first endpoint that answers.
         self._force_generate = False
+        self._openai_mode = False
 
     # -- helpers ------------------------------------------------------------
     def _url(self, path: str) -> str:
@@ -235,11 +241,13 @@ class OllamaClient:
     ) -> Iterator[StreamChunk]:
         """Stream a chat completion, yielding :class:`StreamChunk` objects.
 
-        Primary endpoint is ``POST /api/chat``. If the server answers
-        **404** (Ollama-compatible backends that only expose the classic
-        ``/api/generate`` route), the client transparently retries the turn
-        against ``/api/generate`` with the conversation flattened into a
-        prompt, and latches onto that endpoint for subsequent calls.
+        Endpoint negotiation (each 404 advances to the next candidate):
+
+        1. ``POST /api/chat``               — native Ollama chat wire format
+        2. ``POST /api/generate``           — classic Ollama completion format
+        3. ``POST /v1/chat/completions``    — OpenAI-compatible SSE format
+
+        The first endpoint that answers is latched for subsequent calls.
 
         ``on_retry`` (optional) is invoked whenever a full request attempt
         fails and is about to be retried, so the UI can surface the
@@ -250,41 +258,160 @@ class OllamaClient:
         if max_tokens:
             options["num_predict"] = int(max_tokens)
 
-        if not self._force_generate:
-            chat_payload: dict[str, Any] = {
+        # --- latched OpenAI-compatible mode -------------------------------
+        if self._openai_mode:
+            return self._openai_chat_stream(chosen_model, messages, temperature, max_tokens, on_retry)
+
+        # --- latched generate mode -----------------------------------------
+        if self._force_generate:
+            generate_payload: dict[str, Any] = {
                 "model": chosen_model,
-                "messages": messages,
+                "prompt": self._messages_to_prompt(messages),
                 "stream": True,
                 "keep_alive": keep_alive or self.keep_alive,
                 "options": options,
             }
-            try:
-                response = self._post_with_notify(
-                    "/api/chat", chat_payload, stream=True, on_retry=on_retry
-                )
-            except OllamaAPIError as exc:
-                if exc.status_code == 404:
-                    logger.warning(
-                        "Sunucu /api/chat uç noktasını sunmuyor (404); "
-                        "/api/generate kullanılıyor."
-                    )
-                    self._force_generate = True
-                else:
-                    raise
-            else:
-                return self._iter_stream(response)
+            response = self._post_with_notify(
+                "/api/generate", generate_payload, stream=True, on_retry=on_retry
+            )
+            return self._iter_stream(response)
 
-        generate_payload: dict[str, Any] = {
+        # --- probe: /api/chat ------------------------------------------------
+        chat_payload: dict[str, Any] = {
+            "model": chosen_model,
+            "messages": messages,
+            "stream": True,
+            "keep_alive": keep_alive or self.keep_alive,
+            "options": options,
+        }
+        try:
+            response = self._post_with_notify(
+                "/api/chat", chat_payload, stream=True, on_retry=on_retry
+            )
+        except OllamaAPIError as exc:
+            if exc.status_code != 404:
+                raise
+            logger.warning("Sunucu /api/chat sunmuyor (404); /api/generate deneniyor…")
+        else:
+            return self._iter_stream(response)
+
+        # --- probe: /api/generate -------------------------------------------
+        generate_payload = {
             "model": chosen_model,
             "prompt": self._messages_to_prompt(messages),
             "stream": True,
             "keep_alive": keep_alive or self.keep_alive,
             "options": options,
         }
+        try:
+            response = self._post_with_notify(
+                "/api/generate", generate_payload, stream=True, on_retry=on_retry
+            )
+        except OllamaAPIError as exc:
+            if exc.status_code != 404:
+                raise
+            logger.warning("Sunucu /api/generate sunmuyor (404); /v1/chat/completions deneniyor…")
+        else:
+            self._force_generate = True
+            return self._iter_stream(response)
+
+        # --- probe: /v1/chat/completions ------------------------------------
+        try:
+            chunks_iter = self._openai_chat_stream(
+                chosen_model, messages, temperature, max_tokens, on_retry
+            )
+            first = next(iter(chunks_iter), None)
+        except OllamaAPIError as exc:
+            if exc.status_code != 404:
+                raise
+            raise OllamaAPIError(
+                "Sunucu bilinen hiçbir üretim uç noktasını sunmuyor. "
+                "Denenen yollar: POST /api/chat, POST /api/generate, "
+                "POST /v1/chat/completions — hepsi 404 döndürdü. "
+                f"Sunucunun desteklediği sohbet yolunu öğrenip istemciye ekletin. ({self.base_url})",
+                status_code=404,
+            ) from exc
+        self._openai_mode = True
+
+        def _chain() -> Iterator[StreamChunk]:
+            if first is not None:
+                yield first
+            yield from chunks_iter
+
+        return _chain()
+
+    # -- OpenAI-compatible streaming ----------------------------------------
+    def _openai_chat_stream(
+        self,
+        chosen_model: str,
+        messages: list[dict[str, Any]],
+        temperature: float,
+        max_tokens: int | None,
+        on_retry: Callable[[int, OllamaError], None] | None,
+    ) -> Iterator[StreamChunk]:
+        """``POST /v1/chat/completions`` with SSE (``data: {...}``) frames."""
+        payload: dict[str, Any] = {
+            "model": chosen_model,
+            "messages": messages,
+            "stream": True,
+            "temperature": temperature,
+        }
+        if max_tokens:
+            payload["max_tokens"] = int(max_tokens)
         response = self._post_with_notify(
-            "/api/generate", generate_payload, stream=True, on_retry=on_retry
+            "/v1/chat/completions", payload, stream=True, on_retry=on_retry
         )
-        return self._iter_stream(response)
+        return self._iter_openai_stream(response)
+
+    def _iter_openai_stream(self, response: requests.Response) -> Iterator[StreamChunk]:
+        """Parse Server-Sent-Events frames of the OpenAI chat wire format."""
+        usage = {"prompt_tokens": 0, "completion_tokens": 0}
+        try:
+            for raw_line in response.iter_lines(decode_unicode=True):
+                if not raw_line:
+                    continue
+                line = raw_line.strip()
+                if line.startswith(":"):  # SSE keep-alive comment
+                    continue
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    yield StreamChunk(
+                        text="",
+                        done=True,
+                        prompt_tokens=usage["prompt_tokens"],
+                        completion_tokens=usage["completion_tokens"],
+                        model="",
+                        raw={"done": True},
+                    )
+                    return
+                try:
+                    frame = json.loads(data)
+                except json.JSONDecodeError:
+                    logger.warning("OpenAI akışında çözümlenemeyen çerçeve: %.200s", data)
+                    continue
+                if isinstance(frame.get("usage"), dict):
+                    usage["prompt_tokens"] = int(frame["usage"].get("prompt_tokens", 0) or 0)
+                    usage["completion_tokens"] = int(frame["usage"].get("completion_tokens", 0) or 0)
+                choices = frame.get("choices") or []
+                delta = (choices[0].get("delta") or {}) if choices else {}
+                text = delta.get("content") or ""
+                finished = bool(choices) and choices[0].get("finish_reason") is not None
+                yield StreamChunk(
+                    text=text,
+                    done=finished and not text,
+                    prompt_tokens=usage["prompt_tokens"],
+                    completion_tokens=usage["completion_tokens"],
+                    model=frame.get("model", ""),
+                    raw=frame,
+                )
+        except requests.exceptions.ChunkedEncodingError as exc:
+            raise OllamaConnectionError(f"Akış yarıda kesildi: {exc}") from exc
+        except requests.exceptions.ReadTimeout as exc:
+            raise OllamaTimeoutError("Akış sırasında okuma zaman aşımı") from exc
+        finally:
+            response.close()
 
     @staticmethod
     def _messages_to_prompt(messages: list[dict[str, Any]]) -> str:
