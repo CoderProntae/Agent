@@ -17,6 +17,7 @@ from agentdesk.core.ollama_client import (
     OllamaAPIError,
     OllamaClient,
     OllamaConnectionError,
+    OllamaTimeoutError,
 )
 
 
@@ -118,14 +119,36 @@ def test_http_5xx_raises_typed_error_no_blind_retry(mock_server, monkeypatch):
     assert exc.value.status_code == 500
 
 
-def test_connection_refused_raises_typed_error(monkeypatch):
+def test_unreachable_server_raises_typed_error(monkeypatch):
+    """An unreachable endpoint must raise a typed Ollama error.
+
+    Depending on the OS network stack, an unused loopback port yields either
+    an immediate "connection refused" (typical on Linux) or a connect timeout
+    (typical on Windows runners); both are valid typed connectivity failures,
+    so the test accepts both.
+    """
+    import socket as _socket
+
+    # Bind-then-close an ephemeral port so the target is guaranteed unused.
+    probe = _socket.socket()
+    probe.bind(("127.0.0.1", 0))
+    port = probe.getsockname()[1]
+    probe.close()
+
     monkeypatch.setattr("agentdesk.core.ollama_client.time.sleep", lambda _s: None)
-    client = OllamaClient(base_url="http://127.0.0.1:1", max_retries=2, connect_timeout=1)
-    with pytest.raises(OllamaConnectionError):
+    client = OllamaClient(base_url=f"http://127.0.0.1:{port}", max_retries=2, connect_timeout=2)
+    with pytest.raises((OllamaConnectionError, OllamaTimeoutError)):
         client.chat([{"role": "user", "content": "hi"}])
 
 
 def test_health_false_when_unreachable(monkeypatch):
+    import socket as _socket
+
+    probe = _socket.socket()
+    probe.bind(("127.0.0.1", 0))
+    port = probe.getsockname()[1]
+    probe.close()
+
     monkeypatch.setattr("agentdesk.core.ollama_client.time.sleep", lambda _s: None)
-    client = OllamaClient(base_url="http://127.0.0.1:1", max_retries=0, connect_timeout=1)
+    client = OllamaClient(base_url=f"http://127.0.0.1:{port}", max_retries=0, connect_timeout=2)
     assert client.health() is False
