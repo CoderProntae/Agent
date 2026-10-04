@@ -1,0 +1,4 @@
+# Geliştirme ve CI bağımlılıkları / Development & CI dependencies
+-r requirements.txt
+pytest>=8.0.0
+pyinstaller>=6.3.0,<7

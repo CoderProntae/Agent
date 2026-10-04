@@ -1,0 +1,4 @@
+# AgentDesk - Ana uygulama bağımlılıkları / Core runtime dependencies
+PySide6>=6.6.1,<7
+requests>=2.31.0
+cryptography>=42.0.0

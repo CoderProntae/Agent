@@ -1,0 +1,32 @@
+[project]
+name = "agentdesk"
+version = "1.0.0"
+description = "AgentDesk - Yerel Yapay Zeka Kodlama Ajanı ve Çalışma Alanı Masaüstü Uygulaması (Local AI Coding Agent & Workspace Desktop)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "CoderProntae" }]
+dependencies = [
+    "PySide6>=6.6.1,<7",
+    "requests>=2.31.0",
+    "cryptography>=42.0.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0.0", "pyinstaller>=6.3.0,<7"]
+
+[project.scripts]
+agentdesk = "agentdesk.app:main"
+usagelimiteditor = "agentdesk.usage_editor.main:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["agentdesk*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+filterwarnings = ["ignore::DeprecationWarning"]
